@@ -60,6 +60,18 @@ def _positive_float_env(name: str, default: float) -> float:
         return default
     return value
 
+
+def _float_env(name: str, default: float) -> float:
+    """Parse a float environment variable without breaking module import."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %.2f", name, raw, default)
+        return default
+
 try:
     import discord
     from discord import Message as DiscordMessage, Intents
