@@ -19,6 +19,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import wave
 from collections import defaultdict
 from typing import Callable, Dict, List, Optional, Any, Tuple
 
@@ -30,6 +31,34 @@ _DISCORD_COMMAND_SYNC_STATE_SUBDIR = "gateway"
 _DISCORD_COMMAND_SYNC_STATE_FILENAME = "discord_command_sync_state.json"
 _DISCORD_COMMAND_SYNC_MUTATION_INTERVAL_SECONDS = 4.5
 _DISCORD_COMMAND_SYNC_MAX_RATE_LIMIT_SLEEP_SECONDS = 30.0
+
+
+def _float_env(name: str, default: float) -> float:
+    """Parse a float environment variable without breaking module import."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %.2f", name, raw, default)
+        return default
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    """Parse a positive float environment variable without breaking import."""
+    raw = os.getenv(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %.2f", name, raw, default)
+        return default
+    if value <= 0:
+        logger.warning("Invalid %s=%r; value must be > 0; using default %.2f", name, raw, default)
+        return default
+    return value
 
 try:
     import discord
@@ -175,7 +204,7 @@ class VoiceReceiver:
 
         # SSRC -> user_id mapping (populated from SPEAKING events)
         self._ssrc_to_user: Dict[int, int] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
 
         # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
@@ -377,6 +406,13 @@ class VoiceReceiver:
         if self._dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
+            if not user_id:
+                # Discord often does not deliver a SPEAKING event before the
+                # first post-join audio packets.  Waiting until silence to infer
+                # the SSRC is too late for DAVE: those packets must be decrypted
+                # with the user id before Opus sees them, or the first utterance
+                # can decode to silence/garbage and STT returns empty text.
+                user_id = self._infer_user_for_ssrc(ssrc)
             if user_id:
                 try:
                     import davey
@@ -389,9 +425,9 @@ class VoiceReceiver:
                         if self._packet_debug_count <= 10:
                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
                         return
-            # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
-            # Opus decode directly — audio may be in passthrough mode.
-            # Buffer will get a user_id when SPEAKING event arrives later.
+            # If SSRC remains unknown, skip DAVE and try Opus decode directly —
+            # audio may be in passthrough mode.  If it is actually DAVE audio,
+            # decode will fail or STT will later produce empty text.
 
         # --- Opus decode -> PCM ---
         try:
@@ -428,7 +464,8 @@ class VoiceReceiver:
             ]
             if len(candidates) == 1:
                 uid = candidates[0]
-                self._ssrc_to_user[ssrc] = uid
+                with self._lock:
+                    self._ssrc_to_user[ssrc] = uid
                 logger.info("Auto-mapped ssrc=%d -> user=%d (sole allowed member)", ssrc, uid)
                 return uid
         except Exception:
@@ -547,8 +584,11 @@ class DiscordAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
 
-    # Auto-disconnect from voice channel after this many seconds of inactivity
-    VOICE_TIMEOUT = 300
+    # Auto-disconnect from voice channel after this many seconds of inactivity.
+    # Override with HERMES_DISCORD_VOICE_TIMEOUT, e.g. 3600 for one hour.
+    VOICE_TIMEOUT_DEFAULT = 300.0
+    VOICE_STT_WARMUP_SECONDS = _float_env("HERMES_DISCORD_VOICE_STT_WARMUP_SECONDS", 0.75)
+    VOICE_STT_WARMUP_TIMEOUT = _float_env("HERMES_DISCORD_VOICE_STT_WARMUP_TIMEOUT", 10.0)
 
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.DISCORD)
@@ -1069,9 +1109,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.info("[%s] Skipping Discord slash command sync (policy=off)", self.name)
                 return
 
+            sync_guild_id = self._get_discord_command_sync_guild_id()
+            sync_guild = discord.Object(id=sync_guild_id) if sync_guild_id else None
+            sync_scope = f"guild {sync_guild_id}" if sync_guild_id else "global"
+
             if sync_policy == "bulk":
-                synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
-                logger.info("[%s] Synced %d slash command(s) via bulk tree sync", self.name, len(synced))
+                if sync_guild is not None:
+                    # Guild-scoped command registration propagates immediately and
+                    # uses a separate, friendlier bucket. This is useful for live
+                    # debugging without touching global application commands.
+                    self._client.tree.copy_global_to(guild=sync_guild)
+                    synced = await asyncio.wait_for(self._client.tree.sync(guild=sync_guild), timeout=30)
+                else:
+                    synced = await asyncio.wait_for(self._client.tree.sync(), timeout=30)
+                logger.info("[%s] Synced %d slash command(s) via bulk tree sync (%s)", self.name, len(synced), sync_scope)
                 return
 
             app_id = getattr(self._client, "application_id", None) or getattr(getattr(self._client, "user", None), "id", None)
@@ -1093,7 +1144,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 # discord.py can otherwise sit inside one long retry sleep
                 # before surfacing the 429. Keep the whole sync bounded and
                 # persist Discord's retry-after when it refuses the batch.
-                summary = await asyncio.wait_for(self._safe_sync_slash_commands(), timeout=600)
+                summary = await asyncio.wait_for(
+                    self._safe_sync_slash_commands(guild_id=sync_guild_id), timeout=600
+                )
             except Exception as e:
                 if not self._is_discord_rate_limit(e):
                     raise
@@ -1115,9 +1168,10 @@ class DiscordAdapter(BasePlatformAdapter):
 
             self._record_command_sync_success(app_id, fingerprint, summary)
             logger.info(
-                "[%s] Safely reconciled %d slash command(s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
+                "[%s] Safely reconciled %d slash command(s) (%s): unchanged=%d updated=%d recreated=%d created=%d deleted=%d",
                 self.name,
                 summary["total"],
+                sync_scope,
                 summary["unchanged"],
                 summary["updated"],
                 summary["recreated"],
@@ -1136,16 +1190,43 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.warning("[%s] Slash command sync failed: %s", self.name, e, exc_info=True)
 
     def _get_discord_command_sync_policy(self) -> str:
-        raw = str(os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe") or "").strip().lower()
+        raw_value = self.config.extra.get(
+            "command_sync_policy",
+            self.config.extra.get("sync_policy", os.getenv("DISCORD_COMMAND_SYNC_POLICY", "safe")),
+        )
+        raw = str(raw_value or "").strip().lower()
         if raw in _DISCORD_COMMAND_SYNC_POLICIES:
             return raw
         if raw:
             logger.warning(
-                "[%s] Invalid DISCORD_COMMAND_SYNC_POLICY=%r; falling back to 'safe'",
+                "[%s] Invalid Discord command sync policy %r; falling back to 'safe'",
                 self.name,
                 raw,
             )
         return "safe"
+
+    def _get_discord_command_sync_guild_id(self) -> Optional[int]:
+        """Optional guild ID for faster, isolated Discord command sync.
+
+        Global application commands are slow to propagate and share the app's
+        harsh command-management bucket. A guild ID keeps live debugging out of
+        the global bucket and makes slash command changes visible quickly.
+        """
+        raw_value = self.config.extra.get(
+            "command_sync_guild_id",
+            self.config.extra.get("sync_guild_id", os.getenv("DISCORD_COMMAND_SYNC_GUILD_ID", "")),
+        )
+        raw = str(raw_value or "").strip()
+        if not raw:
+            return None
+        if raw.isdigit():
+            return int(raw)
+        logger.warning(
+            "[%s] Ignoring invalid Discord command sync guild ID %r",
+            self.name,
+            raw,
+        )
+        return None
 
     def _canonicalize_app_command_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Reduce command payloads to the semantic fields Hermes manages."""
@@ -1238,8 +1319,13 @@ class DiscordAdapter(BasePlatformAdapter):
             "options": canonical["options"],
         }
 
-    async def _safe_sync_slash_commands(self) -> Dict[str, int]:
-        """Diff existing global commands and only mutate the commands that changed."""
+    async def _safe_sync_slash_commands(self, guild_id: Optional[int] = None) -> Dict[str, int]:
+        """Diff existing commands and only mutate the commands that changed.
+
+        When ``guild_id`` is provided, reconcile guild-scoped commands instead
+        of global commands. This is much faster for development and avoids the
+        global application-command propagation/bucket mess.
+        """
         if not self._client:
             return {
                 "total": 0,
@@ -1260,7 +1346,8 @@ class DiscordAdapter(BasePlatformAdapter):
             (int(payload.get("type", 1) or 1), str(payload.get("name", "") or "").lower()): payload
             for payload in desired_payloads
         }
-        existing_commands = await tree.fetch_commands()
+        fetch_guild = discord.Object(id=guild_id) if guild_id else None
+        existing_commands = await tree.fetch_commands(guild=fetch_guild)
         existing_by_key = {
             (
                 int(getattr(getattr(command, "type", None), "value", getattr(command, "type", 1)) or 1),
@@ -1288,7 +1375,10 @@ class DiscordAdapter(BasePlatformAdapter):
         for key, desired in desired_by_key.items():
             current = existing_by_key.pop(key, None)
             if current is None:
-                await mutate(http.upsert_global_command, app_id, desired)
+                if guild_id:
+                    await mutate(http.upsert_guild_command, app_id, guild_id, desired)
+                else:
+                    await mutate(http.upsert_global_command, app_id, desired)
                 created += 1
                 continue
 
@@ -1300,16 +1390,26 @@ class DiscordAdapter(BasePlatformAdapter):
                 continue
 
             if self._patchable_app_command_payload(current_existing_payload) == self._patchable_app_command_payload(desired):
-                await mutate(http.delete_global_command, app_id, current.id)
-                await mutate(http.upsert_global_command, app_id, desired)
+                if guild_id:
+                    await mutate(http.delete_guild_command, app_id, guild_id, current.id)
+                    await mutate(http.upsert_guild_command, app_id, guild_id, desired)
+                else:
+                    await mutate(http.delete_global_command, app_id, current.id)
+                    await mutate(http.upsert_global_command, app_id, desired)
                 recreated += 1
                 continue
 
-            await mutate(http.edit_global_command, app_id, current.id, desired)
+            if guild_id:
+                await mutate(http.edit_guild_command, app_id, guild_id, current.id, desired)
+            else:
+                await mutate(http.edit_global_command, app_id, current.id, desired)
             updated += 1
 
         for current in existing_by_key.values():
-            await mutate(http.delete_global_command, app_id, current.id)
+            if guild_id:
+                await mutate(http.delete_guild_command, app_id, guild_id, current.id)
+            else:
+                await mutate(http.delete_global_command, app_id, current.id)
             deleted += 1
 
         return {
@@ -1913,7 +2013,14 @@ class DiscordAdapter(BasePlatformAdapter):
             try:
                 receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
                 receiver.start()
+                receiver.pause()
                 self._voice_receivers[guild_id] = receiver
+                try:
+                    await self._warm_stt_before_voice_input(guild_id)
+                except Exception as e:
+                    logger.debug("Voice STT warmup failed for guild %s: %s", guild_id, e, exc_info=True)
+                finally:
+                    receiver.resume()
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
                     self._voice_listen_loop(guild_id)
                 )
@@ -1921,6 +2028,52 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.warning("Voice receiver failed to start: %s", e)
 
             return True
+
+    async def _warm_stt_before_voice_input(self, guild_id: int) -> None:
+        """Warm STT and let the receiver settle before accepting voice input.
+
+        The first voice-channel utterance after join can hit two cold paths at
+        once: Discord's SSRC/decoder setup and the local STT model.  Keep the
+        receiver paused, wait briefly for the voice socket to settle, then send
+        a tiny silent WAV through the configured STT backend and discard the
+        result.  Failures are non-fatal; they should not prevent joining.
+        """
+        try:
+            if self.VOICE_STT_WARMUP_SECONDS > 0:
+                await asyncio.sleep(self.VOICE_STT_WARMUP_SECONDS)
+            timeout = max(0.1, float(self.VOICE_STT_WARMUP_TIMEOUT))
+            await asyncio.wait_for(
+                asyncio.to_thread(self._run_stt_warmup_probe),
+                timeout=timeout,
+            )
+            logger.info("Voice STT warmup completed for guild %s", guild_id)
+        except asyncio.TimeoutError:
+            logger.debug(
+                "Voice STT warmup timed out for guild %s after %.1fs",
+                guild_id, self.VOICE_STT_WARMUP_TIMEOUT,
+            )
+        except Exception as e:
+            logger.debug("Voice STT warmup failed for guild %s: %s", guild_id, e, exc_info=True)
+
+    @staticmethod
+    def _run_stt_warmup_probe() -> None:
+        """Call the configured STT backend with disposable silence."""
+        tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_stt_warmup_", delete=False)
+        wav_path = tmp_f.name
+        tmp_f.close()
+        try:
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(16000)
+                wf.writeframes(b"\x00\x00" * 16000)
+            from tools.transcription_tools import transcribe_audio
+            transcribe_audio(wav_path)
+        finally:
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
@@ -2009,10 +2162,14 @@ class DiscordAdapter(BasePlatformAdapter):
             self._voice_timeout_handler(guild_id)
         )
 
+    def _get_voice_timeout(self) -> float:
+        """Return the Discord voice-channel inactivity timeout in seconds."""
+        return _positive_float_env("HERMES_DISCORD_VOICE_TIMEOUT", self.VOICE_TIMEOUT_DEFAULT)
+
     async def _voice_timeout_handler(self, guild_id: int) -> None:
-        """Auto-disconnect after VOICE_TIMEOUT seconds of inactivity."""
+        """Auto-disconnect after the configured voice inactivity timeout."""
         try:
-            await asyncio.sleep(self.VOICE_TIMEOUT)
+            await asyncio.sleep(self._get_voice_timeout())
         except asyncio.CancelledError:
             return
         text_ch_id = self._voice_text_channels.get(guild_id)
@@ -2168,7 +2325,11 @@ class DiscordAdapter(BasePlatformAdapter):
             if not result.get("success"):
                 return
             transcript = result.get("transcript", "").strip()
-            if not transcript or is_whisper_hallucination(transcript):
+            if not transcript:
+                logger.info("Voice input from user %d produced empty transcript", user_id)
+                return
+            if is_whisper_hallucination(transcript):
+                logger.info("Filtered voice STT hallucination from user %d: %s", user_id, transcript[:100])
                 return
 
             logger.info("Voice input from user %d: %s", user_id, transcript[:100])
