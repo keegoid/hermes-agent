@@ -13,12 +13,6 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
-## Agent PR Flow
-
-Agent-authored branch, commit, push, PR, review, and post-merge cleanup work
-routes through `~/keegoid/ops/bin/agent-pr-flow`; see
-`~/keegoid/org/playbooks/agent_pr_flow.md`.
-
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
