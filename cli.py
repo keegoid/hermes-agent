@@ -8945,11 +8945,13 @@ class HermesCLI:
                 f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
             )
 
+            _cprint(f"{_DIM}🔊 speaking…{_RST}")
             text_to_speech_tool(text=tts_text, output_path=mp3_path)
 
             # Play the MP3 directly (the TTS tool returns OGG path but MP3 still exists)
             if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
                 play_audio_file(mp3_path)
+                _cprint(f"{_DIM}🔇 done speaking{_RST}")
                 # Clean up
                 try:
                     os.unlink(mp3_path)
