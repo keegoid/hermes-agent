@@ -2547,6 +2547,7 @@ class HermesCLI:
         self._voice_continuous = False
         self._voice_tts_done = threading.Event()
         self._voice_tts_done.set()
+        self._voice_progress_last_spoken = 0.0
 
         # Status bar visibility (toggled via /statusbar)
         self._status_bar_visible = True
@@ -8637,6 +8638,7 @@ class HermesCLI:
             self._pending_tool_info.setdefault(function_name, []).append(
                 function_args if function_args is not None else {}
             )
+            self._voice_maybe_speak_progress(function_name, preview)
             self._invalidate()
 
         if not self._voice_mode:
@@ -8902,6 +8904,63 @@ class HermesCLI:
                         _cprint(f"{_DIM}Voice auto-restart failed: {e}{_RST}")
                 threading.Thread(target=_restart_recording, daemon=True).start()
 
+    def _voice_config(self) -> dict:
+        try:
+            from hermes_cli.config import load_config
+            raw = load_config().get("voice")
+            return raw if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+
+    def _voice_prepare_tts_text(self, text: str) -> str:
+        """Apply configured CLI TTS brevity mode."""
+        voice_cfg = self._voice_config()
+        mode = str(voice_cfg.get("tts_mode", "full")).lower().strip()
+        if mode not in {"brief", "pai"}:
+            return text
+        max_chars = voice_cfg.get("tts_brief_max_chars", 420)
+        max_sentences = voice_cfg.get("tts_brief_max_sentences", 2)
+        try:
+            max_chars = int(max_chars)
+        except Exception:
+            max_chars = 420
+        try:
+            max_sentences = int(max_sentences)
+        except Exception:
+            max_sentences = 2
+        flat = re.sub(r"\s+", " ", text).strip()
+        if len(flat) <= max_chars:
+            return flat
+        sentences = re.split(r"(?<=[.!?])\s+", flat)
+        brief = " ".join(s for s in sentences[:max(1, max_sentences)] if s).strip()
+        if not brief or len(brief) > max_chars:
+            brief = flat[: max(40, max_chars)].rstrip()
+            brief = re.sub(r"\s+\S*$", "", brief).rstrip() or flat[: max(40, max_chars)].rstrip()
+            brief += "…"
+        return brief
+
+    def _voice_maybe_speak_progress(self, function_name: str, preview: str = None) -> None:
+        voice_cfg = self._voice_config()
+        mode = str(voice_cfg.get("tts_mode", "full")).lower().strip()
+        if mode != "pai" and not voice_cfg.get("progress_tts", False):
+            return
+        if not self._voice_tts:
+            return
+        min_interval = voice_cfg.get("progress_min_interval_seconds", 20)
+        try:
+            min_interval = float(min_interval)
+        except Exception:
+            min_interval = 20.0
+        now = time.monotonic()
+        if now - getattr(self, "_voice_progress_last_spoken", 0.0) < min_interval:
+            return
+        self._voice_progress_last_spoken = now
+        label = preview or function_name.replace("_", " ")
+        label = re.sub(r"\s+", " ", str(label)).strip()
+        if len(label) > 90:
+            label = label[:87].rstrip() + "…"
+        self._voice_speak_response_async(label)
+
     def _voice_speak_response_async(self, text: str) -> None:
         """Schedule TTS and mark it pending before continuous recording can restart."""
         if not self._voice_tts or not text:
@@ -8934,6 +8993,7 @@ class HermesCLI:
             tts_text = re.sub(r'^\s*[-*]\s+', '', tts_text, flags=re.MULTILINE)  # list items
             tts_text = re.sub(r'---+', '', tts_text)              # horizontal rules
             tts_text = re.sub(r'\n{3,}', '\n\n', tts_text)        # excessive newlines
+            tts_text = self._voice_prepare_tts_text(tts_text)
             tts_text = tts_text.strip()
             if not tts_text:
                 return
@@ -8946,13 +9006,13 @@ class HermesCLI:
                 f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
             )
 
-            _cprint(f"{_DIM}🔊 speaking…{_RST}")
+            _cprint(f"{_DIM}speaking…{_RST}")
             text_to_speech_tool(text=tts_text, output_path=mp3_path)
 
             # Play the MP3 directly (the TTS tool returns OGG path but MP3 still exists)
             if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
                 play_audio_file(mp3_path)
-                _cprint(f"{_DIM}🔇 done speaking{_RST}")
+                _cprint(f"{_DIM}done speaking{_RST}")
                 # Clean up
                 try:
                     os.unlink(mp3_path)
