@@ -8989,6 +8989,16 @@ class HermesCLI:
             _cprint(f"Unknown voice subcommand: {subcommand}")
             _cprint("Usage: /voice [on|off|tts|status]")
 
+    def _voice_cli_start_enabled(self) -> bool:
+        """Return whether interactive CLI sessions should start with voice mode enabled."""
+        try:
+            voice_cfg = self.config.get("voice", {}) if isinstance(self.config, dict) else {}
+            if isinstance(voice_cfg, dict):
+                return bool(voice_cfg.get("cli_start_enabled", False))
+        except Exception:
+            pass
+        return False
+
     def _voice_beeps_enabled(self) -> bool:
         """Return whether CLI voice mode should play record start/stop beeps."""
         try:
@@ -11217,6 +11227,9 @@ class HermesCLI:
         # never drift from the live keybinding even if the user edits
         # voice.record_key mid-session (Copilot round-13 on #19835).
         self.set_voice_record_key_cache(_raw_key)
+
+        if self._voice_cli_start_enabled():
+            self._enable_voice_mode()
 
         @kb.add(_voice_key)
         def handle_voice_record(event):
