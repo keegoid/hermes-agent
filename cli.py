@@ -8877,13 +8877,14 @@ class HermesCLI:
                 pass
 
             # Track consecutive no-speech cycles to avoid infinite restart loops.
+            stop_continuous_after_no_speech = False
             if not submitted:
                 self._no_speech_count = getattr(self, '_no_speech_count', 0) + 1
                 if self._no_speech_count >= 3:
                     self._voice_continuous = False
                     self._no_speech_count = 0
+                    stop_continuous_after_no_speech = True
                     _cprint(f"{_DIM}No speech detected 3 times, continuous mode stopped.{_RST}")
-                    return
             else:
                 self._no_speech_count = 0
 
@@ -8891,7 +8892,7 @@ class HermesCLI:
             # restart recording so the user can keep talking.
             # (When transcript IS submitted, process_loop handles restart
             # after chat() completes.)
-            if self._voice_continuous and not submitted and not self._voice_recording:
+            if not stop_continuous_after_no_speech and self._voice_continuous and not submitted and not self._voice_recording:
                 def _restart_recording():
                     try:
                         self._voice_start_recording()
@@ -8988,6 +8989,16 @@ class HermesCLI:
         else:
             _cprint(f"Unknown voice subcommand: {subcommand}")
             _cprint("Usage: /voice [on|off|tts|status]")
+
+    def _voice_cli_start_enabled(self) -> bool:
+        """Return whether interactive CLI sessions should start with voice mode enabled."""
+        try:
+            voice_cfg = self.config.get("voice", {}) if isinstance(self.config, dict) else {}
+            if isinstance(voice_cfg, dict):
+                return bool(voice_cfg.get("cli_start_enabled", False))
+        except Exception:
+            pass
+        return False
 
     def _voice_beeps_enabled(self) -> bool:
         """Return whether CLI voice mode should play record start/stop beeps."""
@@ -11217,6 +11228,9 @@ class HermesCLI:
         # never drift from the live keybinding even if the user edits
         # voice.record_key mid-session (Copilot round-13 on #19835).
         self.set_voice_record_key_cache(_raw_key)
+
+        if self._voice_cli_start_enabled():
+            self._enable_voice_mode()
 
         @kb.add(_voice_key)
         def handle_voice_record(event):
