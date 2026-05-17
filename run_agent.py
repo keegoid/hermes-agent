@@ -4041,6 +4041,53 @@ class AIAgent:
         
         return None
 
+    def _reasoning_only_fallback_response(self, assistant_message) -> Optional[str]:
+        """Return a non-empty user-facing fallback for reasoning-only responses.
+
+        Some local/OpenRouter-compatible backends (notably Qwen variants) can put
+        the entire answer in ``reasoning`` / ``reasoning_content`` while leaving
+        ``message.content`` empty.  Hermes retries/prefills those cases first; if
+        the model still never emits visible content, do not surface the terminal
+        ``(empty)`` sentinel when the reasoning payload contains a concise answer.
+
+        To avoid dumping a full scratchpad as final output, only pass through
+        short, plain, answer-shaped reasoning.  Longer or obviously deliberative
+        reasoning gets a diagnostic instead; the detailed reasoning remains in
+        the session's reasoning metadata for UIs that explicitly show it.
+        """
+        reasoning_text = self._extract_reasoning(assistant_message)
+        if not reasoning_text:
+            return None
+
+        cleaned = self._strip_think_blocks(str(reasoning_text)).strip()
+        cleaned = re.sub(
+            r"</?(?:REASONING_SCRATCHPAD|think|thinking|thought|reasoning)>",
+            "",
+            cleaned,
+            flags=re.IGNORECASE,
+        ).strip()
+        if not cleaned:
+            return None
+
+        compact = re.sub(r"\s+", " ", cleaned).strip()
+        deliberation_markers = re.compile(
+            r"\b(i need to|we need to|let me|the user|tool call|scratchpad|"
+            r"reasoning|thinking|analy[sz]e|step\s*\d|first,|next,|therefore)\b",
+            re.IGNORECASE,
+        )
+        if (
+            len(compact) <= 240
+            and cleaned.count("\n") <= 2
+            and not deliberation_markers.search(compact)
+        ):
+            return compact
+
+        return (
+            "Model returned reasoning-only output with no visible assistant content "
+            "after retries. Hidden reasoning was preserved in session metadata, "
+            "but not exposed as final text."
+        )
+
     def _cleanup_task_resources(self, task_id: str) -> None:
         """Clean up VM and browser resources for a given task.
 
@@ -15600,12 +15647,42 @@ class AIAgent:
                                 continue
 
                         # Exhausted retries and fallback chain (or no
-                        # fallback configured).  Fall through to the
-                        # "(empty)" terminal.
+                        # fallback configured).  If the provider gave us a
+                        # reasoning-only payload, produce a safe non-empty
+                        # user-facing fallback instead of the terminal
+                        # "(empty)" sentinel.  Local Qwen/OpenRouter-compatible
+                        # routes can put short final answers (e.g. "ok") in
+                        # reasoning_content with message.content left empty.
                         _turn_exit_reason = "empty_response_exhausted"
                         reasoning_text = self._extract_reasoning(assistant_message)
+                        reasoning_fallback = self._reasoning_only_fallback_response(
+                            assistant_message
+                        )
                         self._drop_trailing_empty_response_scaffolding(messages)
                         assistant_msg = self._build_assistant_message(assistant_message, finish_reason)
+
+                        if reasoning_fallback:
+                            assistant_msg["content"] = reasoning_fallback
+                            messages.append(assistant_msg)
+                            final_response = reasoning_fallback
+                            reasoning_preview = (
+                                reasoning_text[:500] + "..."
+                                if reasoning_text and len(reasoning_text) > 500
+                                else reasoning_text
+                            )
+                            logger.warning(
+                                "Reasoning-only response (no visible content) "
+                                "after exhausting retries and fallback. "
+                                "Returning safe fallback. Reasoning preview: %s",
+                                reasoning_preview,
+                            )
+                            self._emit_status(
+                                "⚠️ Model produced reasoning but no visible "
+                                "response after all retries. Returning safe "
+                                "reasoning-only fallback."
+                            )
+                            break
+
                         assistant_msg["content"] = "(empty)"
                         # This is a user-facing failure sentinel for the gateway,
                         # not real assistant content. Persisting it makes later
@@ -15615,30 +15692,18 @@ class AIAgent:
                         assistant_msg["_empty_terminal_sentinel"] = True
                         messages.append(assistant_msg)
 
-                        if reasoning_text:
-                            reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
-                            logger.warning(
-                                "Reasoning-only response (no visible content) "
-                                "after exhausting retries and fallback. "
-                                "Reasoning: %s", reasoning_preview,
-                            )
-                            self._emit_status(
-                                "⚠️ Model produced reasoning but no visible "
-                                "response after all retries. Returning empty."
-                            )
-                        else:
-                            logger.warning(
-                                "Empty response (no content or reasoning) "
-                                "after %d retries. No fallback available. "
-                                "model=%s provider=%s",
-                                self._empty_content_retries, self.model,
-                                self.provider,
-                            )
-                            self._emit_status(
-                                "❌ Model returned no content after all retries"
-                                + (" and fallback attempts." if self._fallback_chain else
-                                   ". No fallback providers configured.")
-                            )
+                        logger.warning(
+                            "Empty response (no content or reasoning) "
+                            "after %d retries. No fallback available. "
+                            "model=%s provider=%s",
+                            self._empty_content_retries, self.model,
+                            self.provider,
+                        )
+                        self._emit_status(
+                            "❌ Model returned no content after all retries"
+                            + (" and fallback attempts." if self._fallback_chain else
+                               ". No fallback providers configured.")
+                        )
 
                         final_response = "(empty)"
                         break

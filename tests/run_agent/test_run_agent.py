@@ -2645,14 +2645,14 @@ class TestRunConversation:
         assert result["api_calls"] == 2
 
     def test_reasoning_only_local_resumed_no_compression_triggered(self, agent):
-        """Reasoning-only responses no longer trigger compression — prefill then accepted."""
+        """Reasoning-only responses no longer trigger compression — concise fallback accepted."""
         self._setup_agent(agent)
         agent.base_url = "http://127.0.0.1:1234/v1"
         agent.compression_enabled = True
         empty_resp = _mock_response(
             content=None,
             finish_reason="stop",
-            reasoning_content="reasoning only",
+            reasoning_content="ok",
         )
         prefill = [
             {"role": "user", "content": "old question"},
@@ -2671,16 +2671,16 @@ class TestRunConversation:
 
         mock_compress.assert_not_called()  # no compression triggered
         assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
+        assert result["final_response"] == "ok"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
 
-    def test_reasoning_only_response_prefill_then_empty(self, agent):
-        """Structured reasoning-only triggers prefill (2), then retries (3), then (empty)."""
+    def test_reasoning_only_response_prefill_then_safe_fallback(self, agent):
+        """Structured reasoning-only triggers prefill/retries, then concise fallback."""
         self._setup_agent(agent)
         empty_resp = _mock_response(
             content=None,
             finish_reason="stop",
-            reasoning_content="structured reasoning answer",
+            reasoning_content="ok",
         )
         # 6 responses: 1 original + 2 prefill + 3 retries after prefill exhaustion
         agent.client.chat.completions.create.side_effect = [empty_resp] * 6
@@ -2691,8 +2691,31 @@ class TestRunConversation:
         ):
             result = agent.run_conversation("answer me")
         assert result["completed"] is True
-        assert result["final_response"] == "(empty)"
+        assert result["final_response"] == "ok"
         assert result["api_calls"] == 6  # 1 original + 2 prefill + 3 retries
+
+    def test_reasoning_only_long_scratchpad_gets_safe_diagnostic(self, agent):
+        """Long/deliberative reasoning-only output is not exposed as final text."""
+        self._setup_agent(agent)
+        scratchpad_resp = _mock_response(
+            content=None,
+            finish_reason="stop",
+            reasoning_content=(
+                "I need to analyze the user's request step 1. "
+                "The user expects a concise final answer, but this is scratchpad."
+            ),
+        )
+        agent.client.chat.completions.create.side_effect = [scratchpad_resp] * 6
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("answer me")
+        assert result["completed"] is True
+        assert result["final_response"].startswith("Model returned reasoning-only output")
+        assert "I need to analyze" not in result["final_response"]
+        assert result["api_calls"] == 6
 
     def test_reasoning_only_prefill_succeeds_on_continuation(self, agent):
         """When prefill continuation produces content, it becomes the final response."""
