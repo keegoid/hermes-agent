@@ -1085,6 +1085,11 @@ class AIAgent:
         from agent.agent_runtime_helpers import extract_reasoning
         return extract_reasoning(self, assistant_message)
 
+    def _reasoning_only_fallback_response(self, assistant_message) -> Optional[str]:
+        """Forwarder — see ``agent.agent_runtime_helpers.reasoning_only_fallback_response``."""
+        from agent.agent_runtime_helpers import reasoning_only_fallback_response
+        return reasoning_only_fallback_response(self, assistant_message)
+
     def _cleanup_task_resources(self, task_id: str) -> None:
         """Forwarder — see ``agent.chat_completion_helpers.cleanup_task_resources``."""
         from agent.chat_completion_helpers import cleanup_task_resources

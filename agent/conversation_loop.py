@@ -3729,12 +3729,42 @@ def run_conversation(
                             continue
 
                     # Exhausted retries and fallback chain (or no
-                    # fallback configured).  Fall through to the
-                    # "(empty)" terminal.
+                    # fallback configured).  If the provider gave us a
+                    # reasoning-only payload, produce a safe non-empty
+                    # user-facing fallback instead of the terminal
+                    # "(empty)" sentinel.  Local Qwen/OpenRouter-compatible
+                    # routes can put short final answers (e.g. "ok") in
+                    # reasoning_content with message.content left empty.
                     _turn_exit_reason = "empty_response_exhausted"
                     reasoning_text = agent._extract_reasoning(assistant_message)
+                    reasoning_fallback = agent._reasoning_only_fallback_response(
+                        assistant_message
+                    )
                     agent._drop_trailing_empty_response_scaffolding(messages)
                     assistant_msg = agent._build_assistant_message(assistant_message, finish_reason)
+
+                    if reasoning_fallback:
+                        assistant_msg["content"] = reasoning_fallback
+                        messages.append(assistant_msg)
+                        final_response = reasoning_fallback
+                        reasoning_preview = (
+                            reasoning_text[:500] + "..."
+                            if reasoning_text and len(reasoning_text) > 500
+                            else reasoning_text
+                        )
+                        logger.warning(
+                            "Reasoning-only response (no visible content) "
+                            "after exhausting retries and fallback. "
+                            "Returning safe fallback. Reasoning preview: %s",
+                            reasoning_preview,
+                        )
+                        agent._emit_status(
+                            "⚠️ Model produced reasoning but no visible "
+                            "response after all retries. Returning safe "
+                            "reasoning-only fallback."
+                        )
+                        break
+
                     assistant_msg["content"] = "(empty)"
                     # This is a user-facing failure sentinel for the gateway,
                     # not real assistant content. Persisting it makes later
@@ -3744,30 +3774,18 @@ def run_conversation(
                     assistant_msg["_empty_terminal_sentinel"] = True
                     messages.append(assistant_msg)
 
-                    if reasoning_text:
-                        reasoning_preview = reasoning_text[:500] + "..." if len(reasoning_text) > 500 else reasoning_text
-                        logger.warning(
-                            "Reasoning-only response (no visible content) "
-                            "after exhausting retries and fallback. "
-                            "Reasoning: %s", reasoning_preview,
-                        )
-                        agent._emit_status(
-                            "⚠️ Model produced reasoning but no visible "
-                            "response after all retries. Returning empty."
-                        )
-                    else:
-                        logger.warning(
-                            "Empty response (no content or reasoning) "
-                            "after %d retries. No fallback available. "
-                            "model=%s provider=%s",
-                            agent._empty_content_retries, agent.model,
-                            agent.provider,
-                        )
-                        agent._emit_status(
-                            "❌ Model returned no content after all retries"
-                            + (" and fallback attempts." if agent._fallback_chain else
-                               ". No fallback providers configured.")
-                        )
+                    logger.warning(
+                        "Empty response (no content or reasoning) "
+                        "after %d retries. No fallback available. "
+                        "model=%s provider=%s",
+                        agent._empty_content_retries, agent.model,
+                        agent.provider,
+                    )
+                    agent._emit_status(
+                        "❌ Model returned no content after all retries"
+                        + (" and fallback attempts." if agent._fallback_chain else
+                           ". No fallback providers configured.")
+                    )
 
                     final_response = "(empty)"
                     break

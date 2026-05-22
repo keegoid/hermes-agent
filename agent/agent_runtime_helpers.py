@@ -993,9 +993,56 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
     # Combine all reasoning parts
     if reasoning_parts:
         return "\n\n".join(reasoning_parts)
-    
+
     return None
 
+
+def reasoning_only_fallback_response(agent, assistant_message) -> Optional[str]:
+    """Return a non-empty user-facing fallback for reasoning-only responses.
+
+    Some local/OpenRouter-compatible backends (notably Qwen variants) can put
+    the entire answer in ``reasoning`` / ``reasoning_content`` while leaving
+    ``message.content`` empty.  Hermes retries/prefills those cases first; if
+    the model still never emits visible content, do not surface the terminal
+    ``(empty)`` sentinel when the reasoning payload contains a concise answer.
+
+    To avoid dumping a full scratchpad as final output, only pass through
+    short, plain, answer-shaped reasoning.  Longer or obviously deliberative
+    reasoning gets a diagnostic instead; the detailed reasoning remains in
+    the session's reasoning metadata for UIs that explicitly show it.
+    """
+    reasoning_text = extract_reasoning(agent, assistant_message)
+    if not reasoning_text:
+        return None
+
+    cleaned = strip_think_blocks(agent, str(reasoning_text)).strip()
+    cleaned = re.sub(
+        r"</?(?:REASONING_SCRATCHPAD|think|thinking|thought|reasoning)>",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    ).strip()
+    if not cleaned:
+        return None
+
+    compact = re.sub(r"\s+", " ", cleaned).strip()
+    deliberation_markers = re.compile(
+        r"\b(i need to|we need to|let me|the user|tool call|scratchpad|"
+        r"reasoning|thinking|analy[sz]e|step\s*\d|first,|next,|therefore)\b",
+        re.IGNORECASE,
+    )
+    if (
+        len(compact) <= 240
+        and cleaned.count("\n") <= 2
+        and not deliberation_markers.search(compact)
+    ):
+        return compact
+
+    return (
+        "Model returned reasoning-only output with no visible assistant content "
+        "after retries. Hidden reasoning was preserved in session metadata, "
+        "but not exposed as final text."
+    )
 
 
 def dump_api_request_debug(
