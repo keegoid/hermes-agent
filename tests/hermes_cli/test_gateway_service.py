@@ -38,6 +38,10 @@ class TestUserSystemdPrivateSocketPreflight:
 
 
 class TestSystemdServiceRefresh:
+    @pytest.fixture(autouse=True)
+    def _skip_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda auto_enable_linger=True: None)
+
     def test_systemd_install_repairs_outdated_unit_without_force(self, tmp_path, monkeypatch):
         unit_path = tmp_path / "hermes-gateway.service"
         unit_path.write_text("old unit\n", encoding="utf-8")
@@ -678,6 +682,58 @@ class TestLaunchdServiceRecovery:
         assert "stale" in output.lower()
         assert "not loaded" in output.lower()
 
+    def test_launchd_status_uses_print_domain_for_loaded_service(self, tmp_path, monkeypatch, capsys):
+        plist_path = tmp_path / "ai.hermes.gateway-dev-ceo.plist"
+        plist_path.write_text("<plist>current</plist>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "launchd_plist_is_current", lambda: True)
+        monkeypatch.setattr(gateway_cli, "_launchd_service_target", lambda: "gui/501/ai.hermes.gateway-dev-ceo")
+
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if cmd == ["launchctl", "print", "gui/501/ai.hermes.gateway-dev-ceo"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="gui/501/ai.hermes.gateway-dev-ceo = {\n\tstate = running\n\tpid = 55018\n}\n",
+                    stderr="",
+                )
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        gateway_cli.launchd_status()
+
+        output = capsys.readouterr().out
+        assert "Gateway service is loaded" in output
+        assert "Gateway service is running (PID: 55018)" in output
+        assert "not loaded" not in output.lower()
+        assert calls == [["launchctl", "print", "gui/501/ai.hermes.gateway-dev-ceo"]]
+
+    def test_get_service_pids_reads_launchd_print_pid(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway-dev-ceo.plist"
+        plist_path.write_text("<plist>current</plist>", encoding="utf-8")
+
+        monkeypatch.setattr(gateway_cli, "supports_systemd_services", lambda: False)
+        monkeypatch.setattr(gateway_cli, "is_macos", lambda: True)
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+        monkeypatch.setattr(gateway_cli, "_launchd_service_target", lambda: "gui/501/ai.hermes.gateway-dev-ceo")
+
+        def fake_run(cmd, **kwargs):
+            if cmd == ["launchctl", "print", "gui/501/ai.hermes.gateway-dev-ceo"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout="gui/501/ai.hermes.gateway-dev-ceo = {\n\tstate = running\n\tpid = 55018\n}\n",
+                    stderr="",
+                )
+            raise AssertionError(f"Unexpected command: {cmd}")
+
+        monkeypatch.setattr(gateway_cli.subprocess, "run", fake_run)
+
+        assert gateway_cli._get_service_pids() == {55018}
+
 
 class TestGatewayServiceDetection:
     def test_supports_systemd_services_requires_systemctl_binary(self, monkeypatch):
@@ -737,6 +793,10 @@ class TestGatewayServiceDetection:
         assert gateway_cli._is_service_running() is False
 
 class TestGatewaySystemServiceRouting:
+    @pytest.fixture(autouse=True)
+    def _skip_user_systemd_preflight(self, monkeypatch):
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda auto_enable_linger=True: None)
+
     def test_systemd_restart_gracefully_restarts_running_service_and_waits(self, monkeypatch, capsys):
         calls = []
 

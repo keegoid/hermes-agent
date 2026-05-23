@@ -7,6 +7,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 import asyncio
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -64,6 +65,14 @@ class GatewayRuntimeSnapshot:
 
 
 @dataclass(frozen=True)
+class LaunchdServiceSnapshot:
+    loaded: bool
+    running: bool
+    pid: int | None = None
+    output: str = ""
+
+
+@dataclass(frozen=True)
 class ProfileGatewayProcess:
     profile: str
     path: Path
@@ -110,22 +119,9 @@ def _get_service_pids() -> set:
     # --- launchd (macOS) ---
     if is_macos():
         try:
-            label = get_launchd_label()
-            result = subprocess.run(
-                ["launchctl", "list", label],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                # Output: "PID\tStatus\tLabel" header, then one data line
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split()
-                    if len(parts) >= 3 and parts[2] == label:
-                        try:
-                            pid = int(parts[0])
-                            if pid > 0:
-                                pids.add(pid)
-                        except ValueError:
-                            pass
+            snapshot = _query_launchd_service()
+            if snapshot.pid is not None:
+                pids.add(snapshot.pid)
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
 
@@ -954,19 +950,86 @@ def _recover_pending_systemd_restart(system: bool = False, previous_pid: int | N
     return False
 
 
-def _probe_launchd_service_running() -> bool:
+def _launchd_service_target() -> str:
+    return f"{_launchd_domain()}/{get_launchd_label()}"
+
+
+def _parse_launchd_print_output(output: str) -> LaunchdServiceSnapshot:
+    running = re.search(r"^\s*state = running\s*$", output, re.MULTILINE) is not None
+    pid: int | None = None
+    match = re.search(r"^\s*pid = (\d+)\s*$", output, re.MULTILINE)
+    if match:
+        try:
+            parsed = int(match.group(1))
+            if parsed > 0:
+                pid = parsed
+        except ValueError:
+            pid = None
+    return LaunchdServiceSnapshot(
+        loaded=bool(output.strip()),
+        running=running,
+        pid=pid,
+        output=output,
+    )
+
+
+def _parse_launchd_list_output(output: str, label: str) -> LaunchdServiceSnapshot:
+    for line in output.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 3 and parts[2] == label:
+            pid: int | None = None
+            try:
+                parsed = int(parts[0])
+                if parsed > 0:
+                    pid = parsed
+            except ValueError:
+                pid = None
+            return LaunchdServiceSnapshot(
+                loaded=True,
+                running=pid is not None,
+                pid=pid,
+                output=output,
+            )
+    return LaunchdServiceSnapshot(
+        loaded=bool(output.strip()),
+        running=False,
+        output=output,
+    )
+
+
+def _query_launchd_service() -> LaunchdServiceSnapshot:
     if not get_launchd_plist_path().exists():
-        return False
+        return LaunchdServiceSnapshot(loaded=False, running=False)
+    target = _launchd_service_target()
+    label = get_launchd_label()
     try:
         result = subprocess.run(
-            ["launchctl", "list", get_launchd_label()],
+            ["launchctl", "print", target],
             capture_output=True,
             text=True,
             timeout=10,
         )
-    except subprocess.TimeoutExpired:
-        return False
-    return result.returncode == 0
+        if result.returncode == 0:
+            return _parse_launchd_print_output(result.stdout)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return LaunchdServiceSnapshot(loaded=False, running=False)
+
+    try:
+        result = subprocess.run(
+            ["launchctl", "list", label],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            return _parse_launchd_list_output(result.stdout, label)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return LaunchdServiceSnapshot(loaded=False, running=False)
+
+
+def _probe_launchd_service_running() -> bool:
+    return _query_launchd_service().running
 
 
 def get_gateway_runtime_snapshot(system: bool = False) -> GatewayRuntimeSnapshot:
@@ -3060,19 +3123,7 @@ def launchd_restart():
 
 def launchd_status(deep: bool = False):
     plist_path = get_launchd_plist_path()
-    label = get_launchd_label()
-    try:
-        result = subprocess.run(
-            ["launchctl", "list", label],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        loaded = result.returncode == 0
-        loaded_output = result.stdout
-    except subprocess.TimeoutExpired:
-        loaded = False
-        loaded_output = ""
+    snapshot = _query_launchd_service()
 
     print(f"Launchd plist: {plist_path}")
     if launchd_plist_is_current():
@@ -3081,9 +3132,15 @@ def launchd_status(deep: bool = False):
         print("⚠ Service definition is stale relative to the current Hermes install")
         print("  Run: hermes gateway start")
 
-    if loaded:
+    if snapshot.loaded:
         print("✓ Gateway service is loaded")
-        print(loaded_output)
+        if snapshot.running:
+            if snapshot.pid is not None:
+                print(f"✓ Gateway service is running (PID: {snapshot.pid})")
+            else:
+                print("✓ Gateway service is running")
+        else:
+            print("⚠ Gateway service is loaded but not running")
     else:
         print("✗ Gateway service is not loaded")
         print("  Service definition exists locally but launchd has not loaded it.")
