@@ -3676,6 +3676,20 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# PR route tasks consume an existing PR as input, so their comments/bodies
+# necessarily cite GitHub PR URLs. Those URLs are route evidence, not proof
+# that the worker opened a new PR for this task.
+_RESPAWN_GUARD_PR_ROUTE_ASSIGNEE_RE = re.compile(
+    r"(^|[-_])(reviewer?|secops)([-_]|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_pr_route_task(row: sqlite3.Row) -> bool:
+    """Return True for reviewer/SecOps route tasks that are allowed to cite PRs."""
+    assignee = row["assignee"] or ""
+    return bool(_RESPAWN_GUARD_PR_ROUTE_ASSIGNEE_RE.search(assignee))
+
 
 @dataclass
 class DispatchResult:
@@ -4608,7 +4622,7 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT last_failure_error FROM tasks WHERE id = ?",
+        "SELECT assignee, last_failure_error FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -4631,6 +4645,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
         return "recent_success"
 
     # 3. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    # Reviewer/SecOps route tasks cite an existing PR as their input; do not
+    # treat those route-evidence URLs as proof that the task opened a new PR.
+    if _is_pr_route_task(row):
+        return None
+
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
     for c in conn.execute(
         "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",

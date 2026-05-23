@@ -1263,6 +1263,33 @@ def test_respawn_guard_active_pr_in_comment(kanban_home):
     assert reason == "active_pr"
 
 
+def test_respawn_guard_allows_pr_route_tasks_with_pr_urls(kanban_home):
+    """Reviewer/SecOps PR route tasks cite existing PRs; that is not new-PR evidence."""
+    with kb.connect() as conn:
+        review = kb.create_task(
+            conn,
+            title="Review keegoid/example#2",
+            body="Review existing PR https://github.com/keegoid/example/pull/2",
+            assignee="dev-codex-reviewer",
+        )
+        secops = kb.create_task(
+            conn,
+            title="SecOps route for keegoid/example#2",
+            body="Security review for https://github.com/keegoid/example/pull/2",
+            assignee="dev-secops",
+        )
+        for task_id in (review, secops):
+            kb.add_comment(
+                conn,
+                task_id,
+                "dev-ceo",
+                "Route evidence: https://github.com/keegoid/example/pull/2",
+            )
+
+        assert kb.check_respawn_guard(conn, review) is None
+        assert kb.check_respawn_guard(conn, secops) is None
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:
@@ -1371,6 +1398,50 @@ def test_dispatch_respawn_guard_skips_active_pr(
     assert t not in res.auto_blocked
     with kb.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_spawns_pr_route_tasks_with_pr_urls(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once must not let existing-PR evidence strand reviewer/SecOps routes."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        review = kb.create_task(
+            conn,
+            title="Review keegoid/example#2",
+            body="Review https://github.com/keegoid/example/pull/2 at pinned SHA",
+            assignee="dev-codex-reviewer",
+        )
+        secops = kb.create_task(
+            conn,
+            title="SecOps keegoid/example#2",
+            body="SecOps route for https://github.com/keegoid/example/pull/2",
+            assignee="dev-secops",
+        )
+        for task_id in (review, secops):
+            kb.add_comment(
+                conn,
+                task_id,
+                "dev-ceo",
+                "Existing PR: https://github.com/keegoid/example/pull/2",
+            )
+
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (review, "active_pr") not in res.respawn_guarded
+    assert (secops, "active_pr") not in res.respawn_guarded
+    assert {review, secops} <= set(spawned_ids)
+    with kb.connect() as conn:
+        review_task = kb.get_task(conn, review)
+        secops_task = kb.get_task(conn, secops)
+        assert review_task is not None
+        assert secops_task is not None
+        assert review_task.status == "running"
+        assert secops_task.status == "running"
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
