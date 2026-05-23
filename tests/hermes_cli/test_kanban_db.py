@@ -1268,15 +1268,19 @@ def test_respawn_guard_allows_pr_route_tasks_with_pr_urls(kanban_home):
     with kb.connect() as conn:
         review = kb.create_task(
             conn,
-            title="Review keegoid/example#2",
-            body="Review existing PR https://github.com/keegoid/example/pull/2",
+            title="Review route: keegoid/example#2 at deadbeef1234",
+            body="Review route for keegoid/example#2 at pinned head deadbeef1234.\n"
+            "\nPR URL: https://github.com/keegoid/example/pull/2",
             assignee="dev-codex-reviewer",
+            idempotency_key="keegoid/example#2@deadbeef1234:dev-codex-review",
         )
         secops = kb.create_task(
             conn,
-            title="SecOps route for keegoid/example#2",
-            body="Security review for https://github.com/keegoid/example/pull/2",
+            title="SecOps route: keegoid/example#2 at deadbeef1234",
+            body="SecOps route for keegoid/example#2 at pinned head deadbeef1234.\n"
+            "\nPR URL: https://github.com/keegoid/example/pull/2",
             assignee="dev-secops",
+            idempotency_key="keegoid/example#2@deadbeef1234:dev-secops",
         )
         for task_id in (review, secops):
             kb.add_comment(
@@ -1288,6 +1292,26 @@ def test_respawn_guard_allows_pr_route_tasks_with_pr_urls(kanban_home):
 
         assert kb.check_respawn_guard(conn, review) is None
         assert kb.check_respawn_guard(conn, secops) is None
+
+
+def test_respawn_guard_dev_codex_reviewer_pr_owner_task_still_active_pr(kanban_home):
+    """dev-codex-reviewer can own PR-creating work; assignee alone is not a route marker."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="Fix flaky dashboard route",
+            body="Implement the fix and open a fork PR when ready.",
+            assignee="dev-codex-reviewer",
+            idempotency_key="implementation:dashboard-route",
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "dev-codex-reviewer",
+            "PR created: https://github.com/keegoid/hermes-agent/pull/123",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
 
 
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
@@ -1412,15 +1436,19 @@ def test_dispatch_respawn_guard_spawns_pr_route_tasks_with_pr_urls(
     with kb.connect() as conn:
         review = kb.create_task(
             conn,
-            title="Review keegoid/example#2",
-            body="Review https://github.com/keegoid/example/pull/2 at pinned SHA",
+            title="Review route: keegoid/example#2 at deadbeef1234",
+            body="Review route for keegoid/example#2 at pinned head deadbeef1234.\n"
+            "\nPR URL: https://github.com/keegoid/example/pull/2",
             assignee="dev-codex-reviewer",
+            idempotency_key="keegoid/example#2@deadbeef1234:dev-codex-review",
         )
         secops = kb.create_task(
             conn,
-            title="SecOps keegoid/example#2",
-            body="SecOps route for https://github.com/keegoid/example/pull/2",
+            title="SecOps route: keegoid/example#2 at deadbeef1234",
+            body="SecOps route for keegoid/example#2 at pinned head deadbeef1234.\n"
+            "\nPR URL: https://github.com/keegoid/example/pull/2",
             assignee="dev-secops",
+            idempotency_key="keegoid/example#2@deadbeef1234:dev-secops",
         )
         for task_id in (review, secops):
             kb.add_comment(
