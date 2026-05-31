@@ -245,7 +245,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 # but get_final_response() can return an empty output list.
                 # Backfill from collected items or synthesize from deltas.
                 _out = getattr(final_response, "output", None)
-                if isinstance(_out, list) and not _out:
+                if _out is None or (isinstance(_out, list) and not _out):
                     if collected_output_items:
                         final_response.output = list(collected_output_items)
                         logger.debug(
@@ -281,6 +281,51 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 exc,
             )
             return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+        except TypeError as exc:
+            err_text = str(exc)
+            output_none_parse_error = "'NoneType' object is not iterable" in err_text
+            if output_none_parse_error:
+                # chatgpt.com/backend-api/codex can emit a terminal
+                # response.completed event whose response snapshot has
+                # output=None even though response.output_item.done events
+                # already carried valid items. openai-python then crashes in
+                # parse_response() before get_final_response() returns. Use
+                # the items/deltas we already collected; fall back to the raw
+                # create(stream=True) path only when there is nothing to
+                # synthesize locally.
+                if collected_output_items:
+                    logger.debug(
+                        "Codex stream: SDK parse_response hit output=None; "
+                        "synthesizing response from %d collected output items",
+                        len(collected_output_items),
+                    )
+                    return SimpleNamespace(
+                        output=list(collected_output_items),
+                        status="completed",
+                    )
+                if agent._codex_streamed_text_parts and not has_tool_calls:
+                    assembled = "".join(agent._codex_streamed_text_parts)
+                    logger.debug(
+                        "Codex stream: SDK parse_response hit output=None; "
+                        "synthesizing response from %d text deltas (%d chars)",
+                        len(agent._codex_streamed_text_parts), len(assembled),
+                    )
+                    return SimpleNamespace(
+                        output=[SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )],
+                        status="completed",
+                    )
+                logger.debug(
+                    "Codex stream: SDK parse_response hit output=None with no "
+                    "collected items; falling back to create(stream=True). %s",
+                    agent._client_log_context(),
+                )
+                return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            raise
         except RuntimeError as exc:
             err_text = str(exc)
             missing_completed = "response.completed" in err_text
@@ -408,7 +453,7 @@ def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None
             if terminal_response is not None:
                 # Backfill empty output from collected stream events
                 _out = getattr(terminal_response, "output", None)
-                if isinstance(_out, list) and not _out:
+                if _out is None or (isinstance(_out, list) and not _out):
                     if collected_output_items:
                         terminal_response.output = list(collected_output_items)
                         logger.debug(
