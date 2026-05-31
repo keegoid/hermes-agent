@@ -186,6 +186,50 @@ class _FakeCreateStream:
         self.closed = True
 
 
+class _FakeStreamWithParseTypeError:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.created")
+        yield SimpleNamespace(type="response.in_progress")
+        yield SimpleNamespace(
+            type="response.output_item.done",
+            item=SimpleNamespace(
+                type="message",
+                role="assistant",
+                status="completed",
+                content=[SimpleNamespace(type="output_text", text="collected ok")],
+            ),
+        )
+        def parse_response():
+            raise TypeError("'NoneType' object is not iterable")
+
+        parse_response()
+
+    def get_final_response(self):
+        raise AssertionError("stream iteration should raise before final response")
+
+
+class _FakeStreamWithUnrelatedTypeError:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.created")
+        yield SimpleNamespace(type="response.output_text.delta", delta="partial")
+        raise TypeError("'NoneType' object is not iterable")
+
+    def get_final_response(self):
+        raise AssertionError("stream iteration should raise before final response")
+
+
 def _codex_request_kwargs():
     return {
         "model": "gpt-5-codex",
@@ -479,6 +523,107 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+
+def test_run_codex_stream_fallback_backfills_output_none_terminal_response(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+    create_stream = _FakeCreateStream(
+        [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.in_progress"),
+            SimpleNamespace(
+                type="response.output_item.done",
+                item=SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text="fallback collected ok")],
+                ),
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", output=None),
+            ),
+        ]
+    )
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeResponsesStream(
+            final_error=RuntimeError("Didn't receive a `response.completed` event.")
+        )
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        assert kwargs.get("stream") is True
+        return create_stream
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+    assert calls == {"stream": 2, "create": 1}
+    assert create_stream.closed is True
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "fallback collected ok"
+
+
+def test_run_codex_stream_recovers_from_sdk_output_none_parse_error(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeStreamWithParseTypeError()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        raise AssertionError("collected stream items should avoid duplicate fallback call")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
+    assert response.status == "completed"
+    assert response.id is None
+    assert response.error is None
+    assert response.output[0].content[0].text == "collected ok"
+
+
+def test_run_codex_stream_reraises_unrelated_output_none_type_error(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeStreamWithUnrelatedTypeError()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        raise AssertionError("unrelated TypeError must not fall back silently")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    with pytest.raises(TypeError, match="'NoneType' object is not iterable"):
+        agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):
