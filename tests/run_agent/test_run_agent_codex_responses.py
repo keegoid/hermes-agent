@@ -205,6 +205,25 @@ class _FakeStreamWithParseTypeError:
                 content=[SimpleNamespace(type="output_text", text="collected ok")],
             ),
         )
+        def parse_response():
+            raise TypeError("'NoneType' object is not iterable")
+
+        parse_response()
+
+    def get_final_response(self):
+        raise AssertionError("stream iteration should raise before final response")
+
+
+class _FakeStreamWithUnrelatedTypeError:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        yield SimpleNamespace(type="response.created")
+        yield SimpleNamespace(type="response.output_text.delta", delta="partial")
         raise TypeError("'NoneType' object is not iterable")
 
     def get_final_response(self):
@@ -577,7 +596,34 @@ def test_run_codex_stream_recovers_from_sdk_output_none_parse_error(monkeypatch)
 
     assert calls == {"stream": 1, "create": 0}
     assert response.status == "completed"
+    assert response.id is None
+    assert response.error is None
     assert response.output[0].content[0].text == "collected ok"
+
+
+def test_run_codex_stream_reraises_unrelated_output_none_type_error(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _FakeStreamWithUnrelatedTypeError()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        raise AssertionError("unrelated TypeError must not fall back silently")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=_fake_stream,
+            create=_fake_create,
+        )
+    )
+
+    with pytest.raises(TypeError, match="'NoneType' object is not iterable"):
+        agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls == {"stream": 1, "create": 0}
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):

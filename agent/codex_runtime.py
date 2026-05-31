@@ -175,6 +175,21 @@ def run_codex_app_server_turn(
 
 
 
+def _is_codex_output_none_parse_type_error(exc: TypeError) -> bool:
+    if "'NoneType' object is not iterable" not in str(exc):
+        return False
+    tb = exc.__traceback__
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        filename = code.co_filename
+        if code.co_name == "parse_response" or (
+            "/openai/" in filename and "stream" in filename
+        ):
+            return True
+        tb = tb.tb_next
+    return False
+
+
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
     """Execute one streaming Responses API request and return the final response."""
     import httpx as _httpx
@@ -183,13 +198,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     max_stream_retries = 1
     has_tool_calls = False
     first_delta_fired = False
-    # Accumulate streamed text so we can recover if get_final_response()
-    # returns empty output (e.g. chatgpt.com backend-api sends
-    # response.incomplete instead of response.completed).
-    agent._codex_streamed_text_parts: list = []
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
+        # Accumulate streamed text for this attempt so we can recover if
+        # get_final_response()/parse_response() loses a valid stream payload.
+        agent._codex_streamed_text_parts: list = []
         collected_output_items: list = []
         try:
             with active_client.responses.stream(**api_kwargs) as stream:
@@ -282,9 +296,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
         except TypeError as exc:
-            err_text = str(exc)
-            output_none_parse_error = "'NoneType' object is not iterable" in err_text
-            if output_none_parse_error:
+            if _is_codex_output_none_parse_type_error(exc):
                 # chatgpt.com/backend-api/codex can emit a terminal
                 # response.completed event whose response snapshot has
                 # output=None even though response.output_item.done events
@@ -300,6 +312,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         len(collected_output_items),
                     )
                     return SimpleNamespace(
+                        id=None,
+                        error=None,
                         output=list(collected_output_items),
                         status="completed",
                     )
@@ -311,6 +325,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         len(agent._codex_streamed_text_parts), len(assembled),
                     )
                     return SimpleNamespace(
+                        id=None,
+                        error=None,
                         output=[SimpleNamespace(
                             type="message",
                             role="assistant",
