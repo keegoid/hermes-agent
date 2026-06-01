@@ -3684,15 +3684,15 @@ _RESPAWN_GUARD_PR_ROUTE_ASSIGNEE_RE = re.compile(
     re.IGNORECASE,
 )
 _RESPAWN_GUARD_PR_ROUTE_TITLE_RE = re.compile(
-    r"^\s*(review|secops)\s+route:",
+    r"^\s*(?:review\s+route|secops\s+(?:route|gate)):",
     re.IGNORECASE,
 )
 _RESPAWN_GUARD_PR_ROUTE_BODY_RE = re.compile(
-    r"^\s*(review|secops)\s+route\s+for\b",
+    r"^\s*(?:review\s+route\s+for\b|secops\s+route\s+for\b|run\s+the\s+secops\s+gate\b)",
     re.IGNORECASE,
 )
 _RESPAWN_GUARD_PR_ROUTE_IDEMPOTENCY_RE = re.compile(
-    r":dev-(codex-review|secops)\b",
+    r":(?:dev-(?:codex-review|secops)|secops)\b",
     re.IGNORECASE,
 )
 

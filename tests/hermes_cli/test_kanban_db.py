@@ -1282,7 +1282,15 @@ def test_respawn_guard_allows_pr_route_tasks_with_pr_urls(kanban_home):
             assignee="dev-secops",
             idempotency_key="keegoid/example#2@deadbeef1234:dev-secops",
         )
-        for task_id in (review, secops):
+        current_secops = kb.create_task(
+            conn,
+            title="SecOps gate: keegoid/example#2 at deadbeef1234",
+            body="Run the SecOps gate for keegoid/example#2 at pinned head deadbeef1234.\n"
+            "\nPR URL: https://github.com/keegoid/example/pull/2",
+            assignee="dev-secops",
+            idempotency_key="keegoid/example#2@deadbeef1234:secops",
+        )
+        for task_id in (review, secops, current_secops):
             kb.add_comment(
                 conn,
                 task_id,
@@ -1292,6 +1300,7 @@ def test_respawn_guard_allows_pr_route_tasks_with_pr_urls(kanban_home):
 
         assert kb.check_respawn_guard(conn, review) is None
         assert kb.check_respawn_guard(conn, secops) is None
+        assert kb.check_respawn_guard(conn, current_secops) is None
 
 
 def test_respawn_guard_dev_codex_reviewer_pr_owner_task_still_active_pr(kanban_home):
@@ -1450,7 +1459,15 @@ def test_dispatch_respawn_guard_spawns_pr_route_tasks_with_pr_urls(
             assignee="dev-secops",
             idempotency_key="keegoid/example#2@deadbeef1234:dev-secops",
         )
-        for task_id in (review, secops):
+        current_secops = kb.create_task(
+            conn,
+            title="SecOps gate: keegoid/example#2 at deadbeef1234",
+            body="Run the SecOps gate for keegoid/example#2 at pinned head deadbeef1234.\n"
+            "\nPR URL: https://github.com/keegoid/example/pull/2",
+            assignee="dev-secops",
+            idempotency_key="keegoid/example#2@deadbeef1234:secops",
+        )
+        for task_id in (review, secops, current_secops):
             kb.add_comment(
                 conn,
                 task_id,
@@ -1462,14 +1479,18 @@ def test_dispatch_respawn_guard_spawns_pr_route_tasks_with_pr_urls(
 
     assert (review, "active_pr") not in res.respawn_guarded
     assert (secops, "active_pr") not in res.respawn_guarded
-    assert {review, secops} <= set(spawned_ids)
+    assert (current_secops, "active_pr") not in res.respawn_guarded
+    assert {review, secops, current_secops} <= set(spawned_ids)
     with kb.connect() as conn:
         review_task = kb.get_task(conn, review)
         secops_task = kb.get_task(conn, secops)
+        current_secops_task = kb.get_task(conn, current_secops)
         assert review_task is not None
         assert secops_task is not None
+        assert current_secops_task is not None
         assert review_task.status == "running"
         assert secops_task.status == "running"
+        assert current_secops_task.status == "running"
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
