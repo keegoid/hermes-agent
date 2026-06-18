@@ -1323,6 +1323,46 @@ def test_respawn_guard_dev_codex_reviewer_pr_owner_task_still_active_pr(kanban_h
     assert reason == "active_pr"
 
 
+def test_respawn_guard_route_phrase_without_route_idempotency_still_active_pr(kanban_home):
+    """Title/body route phrases alone are task text, not enough to bypass active_pr."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="Review route: keegoid/example#2 at deadbeef1234",
+            body="SecOps route for keegoid/example#2 at pinned head deadbeef1234.",
+            assignee="dev-secops",
+            idempotency_key="implementation:not-a-route",
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "worker",
+            "PR created: https://github.com/keegoid/hermes-agent/pull/123",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_accepts_secops_route_body_with_route_idempotency(kanban_home):
+    """Current SecOps route body shape plus route idempotency bypasses active_pr."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="Gate requested for keegoid/example#2",
+            body="SecOps route for keegoid/example#2 at pinned head deadbeef1234.",
+            assignee="dev-secops",
+            idempotency_key="keegoid/example#2@deadbeef1234:secops",
+        )
+        kb.add_comment(
+            conn,
+            t,
+            "dev-ceo",
+            "Route evidence: https://github.com/keegoid/example/pull/2",
+        )
+        reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
 def test_respawn_guard_old_pr_comment_not_guarded(kanban_home):
     """A GitHub PR URL in a comment older than the PR window does not block."""
     with kb.connect() as conn:

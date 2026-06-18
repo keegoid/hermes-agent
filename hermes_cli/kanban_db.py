@@ -3706,11 +3706,19 @@ def _is_pr_route_task(row: sqlite3.Row) -> bool:
     title = row["title"] or ""
     body = row["body"] or ""
     idempotency_key = row["idempotency_key"] or ""
-    return bool(
+
+    # Avoid trusting a single attacker-controlled title/body phrase as enough
+    # to bypass the active-PR guard. DEVELOPMENT PR route creation uses a
+    # route-scoped idempotency suffix; require that canonical marker plus one
+    # human-readable route marker from the title or body.
+    has_route_idempotency = bool(
+        _RESPAWN_GUARD_PR_ROUTE_IDEMPOTENCY_RE.search(idempotency_key)
+    )
+    has_route_shape = bool(
         _RESPAWN_GUARD_PR_ROUTE_TITLE_RE.search(title)
         or _RESPAWN_GUARD_PR_ROUTE_BODY_RE.search(body)
-        or _RESPAWN_GUARD_PR_ROUTE_IDEMPOTENCY_RE.search(idempotency_key)
     )
+    return has_route_idempotency and has_route_shape
 
 
 @dataclass
