@@ -3683,12 +3683,42 @@ _RESPAWN_GUARD_PR_ROUTE_ASSIGNEE_RE = re.compile(
     r"(^|[-_])(reviewer?|secops)([-_]|$)",
     re.IGNORECASE,
 )
+_RESPAWN_GUARD_PR_ROUTE_TITLE_RE = re.compile(
+    r"^\s*(?:review\s+route|secops\s+(?:route|gate)):",
+    re.IGNORECASE,
+)
+_RESPAWN_GUARD_PR_ROUTE_BODY_RE = re.compile(
+    r"^\s*(?:review\s+route\s+for\b|secops\s+route\s+for\b|run\s+the\s+secops\s+gate\b)",
+    re.IGNORECASE,
+)
+_RESPAWN_GUARD_PR_ROUTE_IDEMPOTENCY_RE = re.compile(
+    r":(?:dev-(?:codex-review|secops)|secops)\b",
+    re.IGNORECASE,
+)
 
 
 def _is_pr_route_task(row: sqlite3.Row) -> bool:
     """Return True for reviewer/SecOps route tasks that are allowed to cite PRs."""
     assignee = row["assignee"] or ""
-    return bool(_RESPAWN_GUARD_PR_ROUTE_ASSIGNEE_RE.search(assignee))
+    if not _RESPAWN_GUARD_PR_ROUTE_ASSIGNEE_RE.search(assignee):
+        return False
+
+    title = row["title"] or ""
+    body = row["body"] or ""
+    idempotency_key = row["idempotency_key"] or ""
+
+    # Avoid trusting a single attacker-controlled title/body phrase as enough
+    # to bypass the active-PR guard. DEVELOPMENT PR route creation uses a
+    # route-scoped idempotency suffix; require that canonical marker plus one
+    # human-readable route marker from the title or body.
+    has_route_idempotency = bool(
+        _RESPAWN_GUARD_PR_ROUTE_IDEMPOTENCY_RE.search(idempotency_key)
+    )
+    has_route_shape = bool(
+        _RESPAWN_GUARD_PR_ROUTE_TITLE_RE.search(title)
+        or _RESPAWN_GUARD_PR_ROUTE_BODY_RE.search(body)
+    )
+    return has_route_idempotency and has_route_shape
 
 
 @dataclass
@@ -4622,7 +4652,8 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
     genuinely dead (no live PID on this host).
     """
     row = conn.execute(
-        "SELECT assignee, last_failure_error FROM tasks WHERE id = ?",
+        "SELECT assignee, title, body, idempotency_key, last_failure_error "
+        "FROM tasks WHERE id = ?",
         (task_id,),
     ).fetchone()
     if row is None:
