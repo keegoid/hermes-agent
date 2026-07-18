@@ -125,6 +125,18 @@ def _get_proxy_from_env() -> Optional[str]:
 
 def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
     """Return an env-configured proxy unless NO_PROXY excludes this base URL."""
+    from hermes_cli.local_only_policy import (
+        enforce_local_provider_request,
+        local_only_enabled,
+    )
+
+    if local_only_enabled():
+        enforce_local_provider_request(
+            provider="custom",
+            base_url=base_url,
+            surface="HTTP transport",
+        )
+        return None
     proxy = _get_proxy_from_env()
     if not proxy or not base_url:
         return proxy
@@ -198,6 +210,10 @@ def build_keepalive_http_client(
             verify=verify,
         )
     except Exception:
+        from hermes_cli.local_only_policy import local_only_enabled
+
+        if local_only_enabled():
+            raise
         return None
 
 

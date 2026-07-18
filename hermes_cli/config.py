@@ -1181,6 +1181,8 @@ def _is_env_config_key(key: str) -> bool:
     if "." in key:
         return False
     key_upper = key.upper()
+    if key_upper == "HERMES_LOCAL_ONLY":
+        return True
     api_keys = [
         'OPENROUTER_API_KEY', 'OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'VOICE_TOOLS_OPENAI_KEY',
         'EXA_API_KEY', 'PARALLEL_API_KEY', 'FIRECRAWL_API_KEY', 'FIRECRAWL_API_URL',

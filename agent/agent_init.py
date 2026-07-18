@@ -618,6 +618,15 @@ def init_agent(
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
+    from hermes_cli.local_only_policy import enforce_local_provider_request
+
+    enforce_local_provider_request(
+        provider=requested_provider or provider or "auto",
+        base_url=base_url,
+        surface="direct agent initialization",
+        api_mode=api_mode,
+        external_command=acp_command or command,
+    )
     _install_safe_stdio()
 
     agent.model = model
@@ -729,6 +738,15 @@ def init_agent(
         else:
             agent.api_mode = "chat_completions"
 
+    # Re-check the resolved transport so URL/provider auto-detection cannot
+    # turn an initially unspecified mode into an external/cloud-capable path.
+    enforce_local_provider_request(
+        provider=agent.requested_provider or agent.provider or "auto",
+        base_url=agent.base_url,
+        surface="resolved agent transport",
+        api_mode=agent.api_mode,
+    )
+
     # Credential-pool validation runs AFTER provider auto-detection so
     # a pool scoped to e.g. "anthropic" is not rejected when the agent
     # was constructed with provider=None and an anthropic.com URL.
@@ -797,6 +815,15 @@ def init_agent(
         # from chat_completions to codex_responses after the warm at __init__.
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
+
+    # Model-based transport inference happens after the earlier resolved-mode
+    # check, so enforce once more before any prewarm or request can run.
+    enforce_local_provider_request(
+        provider=agent.requested_provider or agent.provider or "auto",
+        base_url=agent.base_url,
+        surface="final agent transport",
+        api_mode=agent.api_mode,
+    )
 
     # Pre-warm OpenRouter model metadata cache in a background thread.
     # fetch_model_metadata() is cached for 1 hour; this avoids a blocking

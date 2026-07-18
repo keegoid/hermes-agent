@@ -2490,6 +2490,46 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
 
+    # Validate the declared destination before any availability probe or key
+    # lookup can inspect cloud auth. The resolved-destination check below stays
+    # in place because provider routing may still refine the URL or transport.
+    fb_base_url_hint = (fb.get("base_url") or "").strip() or None
+    fb_api_mode_explicit = bool(str(fb.get("api_mode") or "").strip())
+    fb_api_mode = "chat_completions"
+    if fb_api_mode_explicit:
+        fb_api_mode = str(fb.get("api_mode")).strip()
+    elif fb_provider == "anthropic":
+        fb_api_mode = "anthropic_messages"
+    elif fb_base_url_hint:
+        _orig_url = fb_base_url_hint.rstrip("/").lower()
+        if (
+            _orig_url.endswith("/anthropic")
+            or base_url_hostname(fb_base_url_hint) == "api.anthropic.com"
+        ):
+            fb_api_mode = "anthropic_messages"
+
+    from hermes_cli.local_only_policy import (
+        LocalOnlyViolation,
+        enforce_local_provider_request,
+    )
+
+    try:
+        enforce_local_provider_request(
+            provider=fb_provider,
+            base_url=fb_base_url_hint,
+            surface="primary fallback candidate",
+            api_mode=fb_api_mode,
+        )
+    except LocalOnlyViolation as exc:
+        unavailable.add(fb_key)
+        logger.warning(
+            "Fallback skip: %s/%s violates local-only policy (%s)",
+            fb_provider,
+            fb_model,
+            exc,
+        )
+        return agent._try_activate_fallback(reason)
+
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
         unavailable.add(fb_key)
@@ -2536,7 +2576,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # falling through to OpenRouter defaults.
         from hermes_cli.fallback_config import resolve_entry_api_key
 
-        fb_base_url_hint = (fb.get("base_url") or "").strip() or None
         fb_api_key_hint = resolve_entry_api_key(fb)
         # Determine api_mode from the ORIGINAL base_url (before URL transformation).
         # resolve_provider_client() calls _to_openai_base_url() which can rewrite
@@ -2546,24 +2585,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         #
         # An explicit ``api_mode`` on the fallback entry always wins — including
         # an explicit "chat_completions" — and suppresses all re-detection below.
-        fb_api_mode_explicit = bool(str(fb.get("api_mode") or "").strip())
-        fb_api_mode = "chat_completions"
-        if fb_api_mode_explicit:
-            fb_api_mode = str(fb.get("api_mode")).strip()
-        elif fb_provider == "anthropic":
-            # Provider-name check must not be gated on fb_base_url_hint:
-            # an entry that names provider: anthropic without an explicit
-            # base_url uses the provider's default endpoint and must still
-            # resolve to anthropic_messages, not chat_completions.
-            fb_api_mode = "anthropic_messages"
-        elif fb_base_url_hint:
-            _orig_url = fb_base_url_hint.rstrip("/").lower()
-            if (
-                _orig_url.endswith("/anthropic")
-                or base_url_hostname(fb_base_url_hint) == "api.anthropic.com"
-            ):
-                fb_api_mode = "anthropic_messages"
-        
         # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
         # when no explicit key is in the fallback config. Host match
         # (not substring) — see GHSA-76xc-57q6-vm5m.
@@ -2639,6 +2660,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 and base_url_host_matches(fb_base_url, "amazonaws.com")
             ):
                 fb_api_mode = "bedrock_converse"
+
+        from hermes_cli.local_only_policy import enforce_local_provider_request
+
+        enforce_local_provider_request(
+            provider=fb_provider,
+            base_url=fb_base_url,
+            surface="primary fallback activation",
+            api_mode=fb_api_mode,
+        )
 
         old_model = agent.model
         old_provider = agent.provider

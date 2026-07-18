@@ -2458,6 +2458,18 @@ def anthropic_prompt_cache_policy(
 
 
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
+    from hermes_cli.local_only_policy import LocalOnlyViolation, enforce_local_provider_request, local_only_enabled
+
+    enforce_local_provider_request(
+        provider=(
+            getattr(agent, "requested_provider", "")
+            or getattr(agent, "provider", "")
+            or "auto"
+        ),
+        base_url=client_kwargs.get("base_url"),
+        surface=f"primary client creation ({reason})",
+        api_mode=getattr(agent, "api_mode", None),
+    )
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
     # Treat client_kwargs as read-only. Callers pass agent._client_kwargs (or shallow
@@ -2542,6 +2554,10 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         )
         if keepalive_http is not None:
             client_kwargs["http_client"] = keepalive_http
+        elif local_only_enabled():
+            raise LocalOnlyViolation(
+                "Hermes local-only policy could not build a proxy-free primary HTTP transport."
+            )
     # Delegate all rate-limit / 5xx retry to hermes's outer conversation loop,
     # which honors Retry-After and applies adaptive/jittered backoff. The OpenAI
     # SDK default (max_retries=2) uses its own 1-2s backoff that ignores
@@ -2602,14 +2618,23 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     change persists across turns (unlike fallback which is
     turn-scoped).
     """
+    from hermes_cli.local_only_policy import enforce_local_provider_request
     from hermes_cli.providers import determine_api_mode
 
-    # ── Determine api_mode if not provided ──
+    # Determine transport before enforcing the fence so direct callers cannot
+    # hide a cloud-capable API mode behind a loopback-looking provider name.
     # Pass model so dual-wire providers (Nous Portal anthropic/* → Messages)
     # resolve correctly; without it determine_api_mode falls back to the
     # openai_chat overlay default.
     if not api_mode:
         api_mode = determine_api_mode(new_provider, base_url, model=new_model)
+
+    enforce_local_provider_request(
+        provider=new_provider or "auto",
+        base_url=base_url,
+        surface="live model switch",
+        api_mode=api_mode,
+    )
 
     # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
     # /v1 into the anthropic_messages client, which would cause the SDK to

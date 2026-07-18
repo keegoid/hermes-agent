@@ -1741,6 +1741,18 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+    model_cfg = _get_model_config()
+    from hermes_cli.local_only_policy import enforce_local_provider_request
+
+    enforce_local_provider_request(
+        provider=requested_provider,
+        base_url=(
+            explicit_base_url
+            or str(model_cfg.get("base_url") or "").strip()
+            or _getenv("OPENAI_BASE_URL", "").strip()
+        ),
+        surface="main runtime",
+    )
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /

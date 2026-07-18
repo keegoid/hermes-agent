@@ -224,6 +224,8 @@ def _openai_http_client_kwargs(
     async_mode: bool = False,
 ) -> Dict[str, Any]:
     """Inject keepalive httpx client with env-only proxy (not macOS system proxy)."""
+    from hermes_cli.local_only_policy import LocalOnlyViolation, local_only_enabled
+
     try:
         from agent.process_bootstrap import build_keepalive_http_client
         client = build_keepalive_http_client(
@@ -231,7 +233,11 @@ def _openai_http_client_kwargs(
             async_mode=async_mode,
             verify=_resolve_aux_verify(base_url),
         )
-    except (ImportError, AttributeError):
+    except (ImportError, AttributeError) as exc:
+        if local_only_enabled():
+            raise LocalOnlyViolation(
+                "Hermes local-only policy requires a proxy-free auxiliary HTTP transport."
+            ) from exc
         # Version-skewed installs (#64333): a process whose sys.path resolves
         # an older agent/process_bootstrap.py without this helper — seen when
         # the Desktop app's bundled runtime lags a git-installed source tree
@@ -253,6 +259,10 @@ def _openai_http_client_kwargs(
         client = None
 
     if client is None:
+        if local_only_enabled():
+            raise LocalOnlyViolation(
+                "Hermes local-only policy could not build an auxiliary HTTP transport."
+            )
         return {}
     return {"http_client": client}
 
@@ -2324,6 +2334,81 @@ class AsyncBedrockAuxiliaryClient:
         self.base_url = sync_wrapper.base_url
 
 
+def _actual_auxiliary_api_mode(
+    client: Any,
+    configured_api_mode: Optional[str],
+) -> str:
+    """Return the wire protocol implemented by the client being dispatched.
+
+    Provider resolution can auto-wrap a nominally OpenAI-compatible route
+    after its configured mode was captured.  Security checks at the dispatch
+    boundary must therefore trust the concrete wrapper, not that stale mode.
+    """
+    wrapper_modes = (
+        (
+            (AnthropicAuxiliaryClient, AsyncAnthropicAuxiliaryClient),
+            "anthropic_messages",
+        ),
+        ((CodexAuxiliaryClient, AsyncCodexAuxiliaryClient), "codex_responses"),
+        ((BedrockAuxiliaryClient, AsyncBedrockAuxiliaryClient), "bedrock_converse"),
+    )
+    for wrapper_types, api_mode in wrapper_modes:
+        if any(_safe_isinstance(client, wrapper_type) for wrapper_type in wrapper_types):
+            return api_mode
+
+    # These adapters are normally rejected by provider identity or endpoint,
+    # but recognizing them here keeps a stale cached client from masquerading
+    # as chat_completions after configuration changes.
+    try:
+        from agent.gemini_native_adapter import (
+            AsyncGeminiNativeClient,
+            GeminiNativeClient,
+        )
+
+        if any(
+            _safe_isinstance(client, wrapper_type)
+            for wrapper_type in (GeminiNativeClient, AsyncGeminiNativeClient)
+        ):
+            return "gemini_native"
+    except ImportError:
+        pass
+
+    try:
+        from agent.copilot_acp_client import CopilotACPClient
+
+        if _safe_isinstance(client, CopilotACPClient):
+            return "copilot_acp"
+    except ImportError:
+        pass
+
+    return str(configured_api_mode or "chat_completions").strip() or "chat_completions"
+
+
+def _enforce_local_auxiliary_client(
+    client: Any,
+    *,
+    provider: Optional[str],
+    fallback_base_url: Optional[str],
+    configured_api_mode: Optional[str],
+    surface: str,
+) -> None:
+    """Validate the concrete auxiliary client immediately before dispatch."""
+    from hermes_cli.local_only_policy import (
+        enforce_local_provider_request,
+        local_only_enabled,
+    )
+
+    if not local_only_enabled():
+        return
+
+    enforce_local_provider_request(
+        provider=provider or "auto",
+        base_url=str(getattr(client, "base_url", "") or fallback_base_url or ""),
+        surface=surface,
+        api_mode=_actual_auxiliary_api_mode(client, configured_api_mode),
+    )
+
+
 def _endpoint_speaks_anthropic_messages(base_url: str) -> bool:
     """True if the endpoint at ``base_url`` speaks the Anthropic Messages
     protocol instead of OpenAI chat.completions.
@@ -2412,6 +2497,19 @@ def _maybe_wrap_anthropic(
     )
     if not should_wrap:
         return client_obj
+
+    # URL auto-detection happens after the initial route check.  Re-check the
+    # concrete protocol before constructing a native SDK client: Anthropic's
+    # default httpx transport honors proxy environment variables, even for a
+    # loopback URL, and would discard the proxy-free OpenAI client built above.
+    from hermes_cli.local_only_policy import enforce_local_provider_request
+
+    enforce_local_provider_request(
+        provider="custom",
+        base_url=base_url,
+        surface="auxiliary Anthropic transport",
+        api_mode="anthropic_messages",
+    )
 
     try:
         from agent.anthropic_adapter import build_anthropic_client
@@ -3643,6 +3741,14 @@ def _try_custom_endpoint() -> Tuple[Optional[Any], Optional[str]]:
     if custom_base.lower().startswith(_CODEX_AUX_BASE_URL.lower()):
         return None, None
     model = _read_main_model_for_aux() or "gpt-4o-mini"
+    from hermes_cli.local_only_policy import enforce_local_provider_request
+
+    enforce_local_provider_request(
+        provider="custom",
+        base_url=custom_base,
+        surface="auxiliary custom transport",
+        api_mode=custom_mode,
+    )
     logger.debug("Auxiliary client: custom endpoint (%s, api_mode=%s)", model, custom_mode or "chat_completions")
     _clean_base, _dq = _extract_url_query_params(custom_base)
     _extra = {"default_query": _dq} if _dq else {}
@@ -3995,6 +4101,11 @@ def _get_provider_chain() -> List[tuple]:
     provider *is* openai-codex (see Step 1 of ``_resolve_auto``) or when
     a caller explicitly requests it with a model.
     """
+    from hermes_cli.local_only_policy import local_only_enabled
+
+    if local_only_enabled():
+        return []
+
     return [
         ("openrouter", _try_openrouter),
         ("nous", _try_nous),
@@ -4762,6 +4873,14 @@ def _retry_same_provider_sync(
         )
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    _enforce_local_auxiliary_client(
+        retry_client,
+        provider=effective_provider or resolved_provider,
+        fallback_base_url=resolved_base_url,
+        surface=f"auxiliary retry {task or 'unspecified'}",
+        configured_api_mode=resolved_api_mode,
+    )
+
     retry_kwargs = _build_call_kwargs(
         effective_provider or resolved_provider,
         retry_model or final_model,
@@ -4837,6 +4956,14 @@ async def _retry_same_provider_async(
         )
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
+    _enforce_local_auxiliary_client(
+        retry_client,
+        provider=effective_provider or resolved_provider,
+        fallback_base_url=resolved_base_url,
+        surface=f"async auxiliary retry {task or 'unspecified'}",
+        configured_api_mode=resolved_api_mode,
+    )
+
     retry_kwargs = _build_call_kwargs(
         effective_provider or resolved_provider,
         retry_model or final_model,
@@ -5177,6 +5304,13 @@ def _call_fallback_candidate_sync(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    _enforce_local_auxiliary_client(
+        fb_client,
+        provider=destination.provider,
+        fallback_base_url=destination.base_url,
+        surface=f"auxiliary fallback {fb_label}",
+        configured_api_mode=destination.api_mode,
+    )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5200,6 +5334,10 @@ def _call_fallback_candidate_sync(
         )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
+            raise
+        from hermes_cli.local_only_policy import local_only_enabled
+
+        if local_only_enabled():
             raise
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
@@ -5283,6 +5421,13 @@ async def _call_fallback_candidate_async(
         )
         effective_timeout = fb_timeout
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    _enforce_local_auxiliary_client(
+        fb_client,
+        provider=destination.provider,
+        fallback_base_url=destination.base_url,
+        surface=f"auxiliary fallback {fb_label}",
+        configured_api_mode=destination.api_mode,
+    )
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5306,6 +5451,10 @@ async def _call_fallback_candidate_async(
         )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
+            raise
+        from hermes_cli.local_only_policy import local_only_enabled
+
+        if local_only_enabled():
             raise
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
@@ -5375,6 +5524,10 @@ def _try_payment_fallback(
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
     """
+    from hermes_cli.local_only_policy import local_only_enabled
+
+    if local_only_enabled():
+        return None, None, ""
     # Normalise the failed provider label for matching.
     skip = failed_provider.lower().strip()
     # Also skip Step-1 main-provider path if it maps to the same backend.
@@ -5741,8 +5894,16 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     if not provider or not model:
         return None, None
     base_url = str(entry.get("base_url") or "").strip() or None
-    api_key = _fallback_entry_api_key(entry)
     api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
+    from hermes_cli.local_only_policy import enforce_local_provider_request
+
+    enforce_local_provider_request(
+        provider=provider,
+        base_url=base_url or _read_main_base_url(),
+        surface="auxiliary fallback resolution",
+        api_mode=api_mode,
+    )
+    api_key = _fallback_entry_api_key(entry)
     client, resolved_model = resolve_provider_client(
         provider,
         model=model,
@@ -6019,6 +6180,14 @@ def _resolve_auto_route(
                             main_provider, resolved or main_model)
                 return client, resolved or main_model, resolved_provider
 
+    from hermes_cli.local_only_policy import local_only_enabled
+
+    if local_only_enabled():
+        logger.warning(
+            "Auxiliary auto-routing stopped: local main provider unavailable and local-only policy is enabled"
+        )
+        return None, None, ""
+
     # ── Step 2: user-configured fallback policy ─────────────────────────
     # In auto mode, respect the task-specific fallback chain first, then the
     # main agent's top-level fallback_providers/fallback_model chain. The
@@ -6239,6 +6408,21 @@ def resolve_provider_client(
     # which aliases to "kimi-coding") is still reachable via the named-custom
     # branch below.
     original_provider = (provider or "").strip().lower()
+    from hermes_cli.local_only_policy import enforce_local_provider_request
+
+    runtime_base_url = ""
+    if isinstance(main_runtime, dict):
+        runtime_base_url = str(main_runtime.get("base_url") or "").strip()
+    enforce_local_provider_request(
+        provider=original_provider or "auto",
+        base_url=(
+            explicit_base_url
+            or runtime_base_url
+            or _read_main_base_url()
+        ),
+        surface=f"auxiliary task {task or 'unspecified'}",
+        api_mode=api_mode,
+    )
     # Normalise aliases
     provider = _normalize_aux_provider(provider)
 
@@ -6563,7 +6747,17 @@ def resolve_provider_client(
                     else (client, final_model))
         # Try custom first, then API-key providers (Codex excluded here:
         # falling through to Codex with no model is a stale-constant trap).
-        for try_fn in (_try_custom_endpoint, _resolve_api_key_provider):
+        # Under the local-only fence, a missing custom endpoint must stop here;
+        # scanning API-key providers would inspect cloud auth before the final
+        # route guard rejects their clients.
+        from hermes_cli.local_only_policy import local_only_enabled
+
+        provider_resolvers = (
+            (_try_custom_endpoint,)
+            if local_only_enabled()
+            else (_try_custom_endpoint, _resolve_api_key_provider)
+        )
+        for try_fn in provider_resolvers:
             client, default = try_fn()
             if client is not None:
                 final_model = _normalize_resolved_model(model or default, provider)
@@ -6597,6 +6791,21 @@ def resolve_provider_client(
             custom_entry = _get_named_custom_provider(provider)
         if custom_entry:
             custom_base = (custom_entry.get("base_url") or "").strip()
+            # An explicit per-task api_mode override (from
+            # _resolve_task_provider_model) wins; otherwise fall back to what
+            # the provider entry declared. Validate both route fields before
+            # reading an inline/env key or executing key_cmd.
+            entry_api_mode = (
+                api_mode or custom_entry.get("api_mode") or ""
+            ).strip()
+            from hermes_cli.local_only_policy import enforce_local_provider_request
+
+            enforce_local_provider_request(
+                provider=original_provider or provider or "custom",
+                base_url=custom_base,
+                surface=f"auxiliary named custom transport {provider}",
+                api_mode=entry_api_mode,
+            )
             custom_key = (custom_entry.get("api_key") or "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
@@ -6620,9 +6829,6 @@ def resolve_provider_client(
                     "and will 401 on auth-required endpoints",
                     custom_entry.get("name") or provider,
                 )
-            # An explicit per-task api_mode override (from _resolve_task_provider_model)
-            # wins; otherwise fall back to what the provider entry declared.
-            entry_api_mode = (api_mode or custom_entry.get("api_mode") or "").strip()
             if custom_base:
                 final_model = _normalize_resolved_model(
                     model
@@ -7120,6 +7326,11 @@ def _resolve_strict_vision_backend(
     provider: str,
     model: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
+    from hermes_cli.local_only_policy import local_only_enabled
+
+    if local_only_enabled() and _normalize_vision_provider(provider) != "custom":
+        return None, None
+
     provider = _normalize_vision_provider(provider)
     if provider == "copilot":
         return resolve_provider_client("copilot", model, is_vision=True)
@@ -7371,6 +7582,15 @@ def resolve_vision_provider_client(
                     )
                     return _finalize(
                         main_provider, rpc_client, rpc_model or vision_model)
+
+        from hermes_cli.local_only_policy import local_only_enabled
+
+        if local_only_enabled():
+            logger.warning(
+                "Vision auto-routing stopped: local-only policy forbids "
+                "aggregator fallback"
+            )
+            return None, None, None
 
         # Fall back through aggregators (uses their dedicated vision model,
         # not the user's main model) when main provider has no client.
@@ -9430,8 +9650,19 @@ def _call_llm_impl(
         route_info, _fallback_provider_from_label(request_provider), final_model
     )
 
-    # Log what we're about to do — makes auxiliary operations visible
+    # Validate the client that will actually receive the request. Resolution
+    # checks alone are insufficient when a cached or wrapped client survives a
+    # config change.
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
+    _enforce_local_auxiliary_client(
+        client,
+        provider=request_provider,
+        fallback_base_url=resolved_base_url,
+        surface=f"auxiliary dispatch {task or 'unspecified'}",
+        configured_api_mode=resolved_api_mode,
+    )
+
+    # Log what we're about to do — makes auxiliary operations visible
     if task:
         logger.info("Auxiliary %s: using %s (%s)%s",
                      task, request_provider or "auto", final_model or "default",
@@ -10249,10 +10480,20 @@ async def _async_call_llm_impl(
         route_info, _fallback_provider_from_label(request_provider), final_model
     )
 
+    # Revalidate the actual cached/wrapped client immediately before request
+    # construction, mirroring the synchronous dispatch boundary.
+    _client_base = str(getattr(client, "base_url", "") or resolved_base_url or "")
+    _enforce_local_auxiliary_client(
+        client,
+        provider=request_provider,
+        fallback_base_url=resolved_base_url,
+        surface=f"async auxiliary dispatch {task or 'unspecified'}",
+        configured_api_mode=resolved_api_mode,
+    )
+
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
-    _client_base = str(getattr(client, "base_url", "") or "")
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
